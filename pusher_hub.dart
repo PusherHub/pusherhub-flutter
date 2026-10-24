@@ -154,6 +154,22 @@ class PusherHub {
   /// itself instead (e.g. push a specific in-app route via a Navigator/router).
   final void Function(String deepLink)? onNotificationClick;
 
+  /// Optional: called on every tap of a PusherHub notification — whether the
+  /// app was open, in the background or closed — with the Custom Data it was
+  /// sent with (empty if it had none). Open the right screen from it, e.g.
+  /// `if (data['campaign_id'] != null) …`.
+  ///
+  /// Values arrive as text — `{"campaign_id": 232}` gives `'232'` — and a
+  /// nested object or list as its JSON. A tap that launched the app is
+  /// handed over once runApp() has built your app, so a Navigator is there
+  /// to use; if your app starts on a splash screen that moves on by itself,
+  /// keep the data and open the screen after it.
+  final void Function(Map<String, String> data)? onNotificationOpened;
+
+  // What PusherHub itself puts in a push's data next to the Custom Data —
+  // left out of what onNotificationOpened gets.
+  static const _ownDataKeys = {'notification_id', 'click_action', 'deep_link'};
+
   // Bumped from 'pushhub_anonymous_id' to force installs that already
   // persisted an old 'anon-' prefixed id to generate a fresh plain-UUID one.
   static const _anonymousIdKey = 'pushhub_anonymous_id_v2';
@@ -183,6 +199,10 @@ class PusherHub {
   // registration instead of failing.
   final List<RemoteMessage> _pendingOpens = [];
 
+  // The last tap handled, so one tap is never handled twice — a second
+  // registerDevice() call listens for taps a second time.
+  String? _lastOpenedMessageId;
+
   _PusherHubLifecycleObserver? _lifecycleObserver;
   Timer? _heartbeatTimer;
 
@@ -208,6 +228,7 @@ class PusherHub {
     required this.publicKey,
     required this.baseUrl,
     this.onNotificationClick,
+    this.onNotificationOpened,
   });
 
   /// The identity currently registered with the backend for this device —
@@ -238,15 +259,19 @@ class PusherHub {
         _pusherHubLog('Firebase initialized.');
       }
 
-      // Queried as early as possible, right after Firebase is ready — on
-      // some Android devices this returns null if it's only checked later,
-      // after the permission prompt and the register-device network calls
-      // below (a real ~1-2s delay), even though this launch genuinely was
-      // caused by tapping a notification from a fully-killed app. The
-      // RemoteMessage is stashed here and only acted on once _currentToken
-      // is set further down, since reporting the open needs it.
+      // The tap that launched the app, if a notification did — fully
+      // terminated, so onMessageOpenedApp (below) never sees it. Queried as
+      // early as possible, right after Firebase is ready — on some Android
+      // devices this returns null if it's only checked later, after the
+      // permission prompt and the register-device network calls below (a
+      // real ~1-2s delay). Handled at once, so the app gets the tap even if
+      // registering fails; reporting the open waits for the registration by
+      // itself (trackNotificationOpened).
       final messaging = FirebaseMessaging.instance;
       final initialMessage = await messaging.getInitialMessage();
+      if (initialMessage != null) {
+        _handleNotificationOpened(initialMessage);
+      }
 
       // 2. Request push notification permissions
       FirebaseMessaging.onBackgroundMessage(pusherHubBackgroundMessageHandler);
@@ -327,15 +352,6 @@ class PusherHub {
       // Read now, not when registerDevice() was called: a login() or
       // logout() while the token was on its way counts.
       await _registerToken(await _resolvedExternalId(), token);
-
-      // Fires when the app was fully terminated and the user's tap on a
-      // notification is what launched it — onMessageOpenedApp (above) never
-      // sees this case, since there's no already-running app to resume.
-      // Uses the RemoteMessage fetched early above; now that _currentToken
-      // is set, it can actually be reported.
-      if (initialMessage != null) {
-        _handleNotificationOpened(initialMessage);
-      }
     } catch (e) {
       _pusherHubLog('Unexpected error during registration: $e');
     }
@@ -718,12 +734,13 @@ class PusherHub {
   /// the FCM data payload (set server-side in FcmService) purely for this;
   /// a message without one isn't a PusherHub notification and is ignored.
   ///
-  /// The SDK already reports every tap it sees by itself. Call this only for
-  /// the ones it can't see:
+  /// The SDK already reports every tap it sees by itself — and hands each to
+  /// [onNotificationOpened], the simple way to open the right screen. Call
+  /// this only for the ones it can't see:
   /// - Your app reads the launch notification itself with
-  ///   `FirebaseMessaging.instance.getInitialMessage()` to open the right
-  ///   screen. Firebase hands that message out only once, so read it before
-  ///   [registerDevice] and pass it here.
+  ///   `FirebaseMessaging.instance.getInitialMessage()` instead. Firebase
+  ///   hands that message out only once, so read it before [registerDevice]
+  ///   and pass it here.
   /// - A notification your app displayed itself while open on screen (e.g.
   ///   with flutter_local_notifications). Rebuild it from the payload you
   ///   stored: `RemoteMessage(data: payload)`.
@@ -751,13 +768,28 @@ class PusherHub {
   }
 
   /// A tap the SDK saw itself — resuming a backgrounded app, or cold-
-  /// launching a terminated one: report it, then follow its deep link.
+  /// launching a terminated one: report it, hand its Custom Data to
+  /// [onNotificationOpened], then follow its deep link.
   void _handleNotificationOpened(RemoteMessage message) {
     if (message.data['notification_id'] == null) {
       return;
     }
 
+    if (message.messageId != null) {
+      if (message.messageId == _lastOpenedMessageId) return;
+      _lastOpenedMessageId = message.messageId;
+    }
+
     trackNotificationOpened(message);
+
+    final onOpened = onNotificationOpened;
+    if (onOpened != null) {
+      final data = {
+        for (final entry in message.data.entries)
+          if (!_ownDataKeys.contains(entry.key)) entry.key: entry.value.toString(),
+      };
+      _onceOnScreen(() => onOpened(data));
+    }
 
     final deepLink = _deepLinkOf(message);
     if (deepLink != null) {
@@ -782,8 +814,9 @@ class PusherHub {
   /// one, otherwise opens it in an external browser by default — matching
   /// how OneSignal's "Launch URL" behaves out of the box.
   Future<void> _openDeepLink(String deepLink) async {
-    if (onNotificationClick != null) {
-      onNotificationClick!(deepLink);
+    final onClick = onNotificationClick;
+    if (onClick != null) {
+      _onceOnScreen(() => onClick(deepLink));
       return;
     }
 
@@ -797,6 +830,44 @@ class PusherHub {
       await launchUrl(uri, mode: LaunchMode.externalApplication);
     } else {
       _pusherHubLog('No handler available to open deep link: $deepLink');
+    }
+  }
+
+  /// Runs one of the app's tap callbacks once runApp() has built the app (at
+  /// once when it has): a tap that launched the app arrives during start-up
+  /// — often before runApp() — when there's no Navigator to open a screen
+  /// with yet. Rechecked after each frame, never asking for one itself, so
+  /// nothing is drawn early. An error in the callback is reported like any
+  /// Flutter error instead of reaching the SDK, where it would stop
+  /// registration.
+  void _onceOnScreen(void Function() callback) {
+    void run() {
+      try {
+        callback();
+      } catch (error, stack) {
+        FlutterError.reportError(FlutterErrorDetails(
+          exception: error,
+          stack: stack,
+          library: 'pusher_hub',
+          context: ErrorDescription('while handling a notification tap'),
+        ));
+      }
+    }
+
+    final WidgetsBinding binding;
+    try {
+      binding = WidgetsBinding.instance;
+    } catch (_) {
+      // No binding (registerDevice() called before
+      // WidgetsFlutterBinding.ensureInitialized()) — nothing to wait for.
+      run();
+      return;
+    }
+
+    if (binding.rootElement != null) {
+      run();
+    } else {
+      binding.addPostFrameCallback((_) => _onceOnScreen(callback));
     }
   }
 

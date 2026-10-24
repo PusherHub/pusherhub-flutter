@@ -9,6 +9,7 @@ Push notifications and in-app messages for your Flutter app on **Android and iOS
 - Registers each phone with PusherHub and keeps its FCM token up to date
 - Links a phone to your own user id with `login()` — remembered across restarts until `logout()`
 - Reports notification opens and clicks for your delivery stats
+- Hands your app each tapped notification's Custom Data, so you can open the right screen
 - Shows in-app messages (banner, modal, full screen, center popup, bottom sheet) on app open
 - Optional device details (brand, model, app version, language, country, time zone), and GPS-accurate state and city if you turn location on
 
@@ -94,6 +95,28 @@ await pusherHub.login(currentUserId);
 // When they sign out:
 await pusherHub.logout();
 ```
+
+## Opening a screen when a notification is tapped
+
+Put your own data in **Custom Data** when you create a notification — say `{"campaign_id": "232"}` — and get it back on every tap, whether the app was open, in the background or closed:
+
+```dart
+final navigatorKey = GlobalKey<NavigatorState>(); // MaterialApp(navigatorKey: navigatorKey)
+
+final pusherHub = PusherHub(
+  appKey: 'YOUR_APP_KEY',
+  publicKey: 'YOUR_PUBLIC_KEY',
+  baseUrl: 'https://pusherhub.com/api',
+  onNotificationOpened: (data) {
+    final campaignId = data['campaign_id'];
+    if (campaignId != null) {
+      navigatorKey.currentState?.pushNamed('/campaign', arguments: campaignId);
+    }
+  },
+);
+```
+
+Every value arrives as text (`"232"`). A tap that opened a closed app is handed over once `runApp()` has built your app; if it starts on a splash screen that moves on by itself, keep the data and open the screen after it.
 
 ## Keys
 
